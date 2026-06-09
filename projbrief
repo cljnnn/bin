@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Print a compact project brief for the current directory."""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Iterable
+
+
+IGNORE_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".cache",
+    ".idea",
+    ".mypy_cache",
+    ".next",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".turbo",
+    ".venv",
+    ".vscode",
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "target",
+    "vendor",
+}
+
+DOC_NAMES = {
+    "README",
+    "README.md",
+    "README.txt",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CONTRIBUTING.md",
+    "Makefile",
+    "justfile",
+    "Justfile",
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="projbrief",
+        description="Print a compact project brief for a directory.",
+    )
+    parser.add_argument(
+        "path",
+        nargs="?",
+        default=".",
+        help="Project directory to summarize. Defaults to the current directory.",
+    )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=2,
+        help="Directory tree depth to print. Defaults to 2.",
+    )
+    parser.add_argument(
+        "--files",
+        type=int,
+        default=80,
+        help="Maximum tree entries to print. Defaults to 80.",
+    )
+    return parser.parse_args()
+
+
+def fail(message: str) -> None:
+    print(f"projbrief: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def run(command: list[str], cwd: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None
+
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def is_git_repo(root: Path) -> bool:
+    return run(["git", "rev-parse", "--is-inside-work-tree"], root) == "true"
+
+
+def git_summary(root: Path) -> list[str]:
+    if not is_git_repo(root):
+        return ["Git: not a repository"]
+
+    branch = run(["git", "branch", "--show-current"], root) or "detached HEAD"
+    status = run(["git", "status", "--short", "--untracked-files=all"], root)
+    changed = len(status.splitlines()) if status else 0
+
+    return [f"Git: {branch} ({changed} changed file{'s' if changed != 1 else ''})"]
+
+
+def git_changed_entries(root: Path) -> list[str]:
+    if not is_git_repo(root):
+        return []
+    status = run(["git", "status", "--short", "--untracked-files=all"], root)
+    return status.splitlines() if status else []
+
+
+def changed_file_path(entry: str) -> str:
+    path = entry[3:].strip()
+    if " -> " in path:
+        path = path.split(" -> ", 1)[1]
+    return path
+
+
+def changed_files(root: Path, limit: int = 30) -> list[str]:
+    entries = git_changed_entries(root)
+    if not entries:
+        return ["No Git changes"] if is_git_repo(root) else ["Not a Git repository"]
+
+    lines = entries[:limit]
+    if len(entries) > limit:
+        lines.append(f"... {len(entries) - limit} more")
+    return lines
+
+
+def changed_directories(root: Path, limit: int = 10) -> list[str]:
+    entries = git_changed_entries(root)
+    if not entries:
+        return ["No Git changes"] if is_git_repo(root) else ["Not a Git repository"]
+
+    counts: Counter[str] = Counter()
+    for entry in entries:
+        path = changed_file_path(entry)
+        if path.endswith("/"):
+            directory = path.rstrip("/")
+        else:
+            directory = str(Path(path).parent)
+        counts["." if directory == "." else directory] += 1
+
+    return [f"{directory}: {count} file{'s' if count != 1 else ''}" for directory, count in counts.most_common(limit)]
+
+
+def detect_project_types(root: Path) -> list[str]:
+    found: list[str] = []
+
+    if (root / "src-tauri" / "tauri.conf.json").exists() or (root / "src-tauri" / "Cargo.toml").exists():
+        found.append("Tauri")
+
+    markers = [
+        ("Node.js", ["package.json", "pnpm-lock.yaml", "yarn.lock", "package-lock.json"]),
+        ("Python", ["pyproject.toml", "requirements.txt", "setup.py", "Pipfile"]),
+        ("Rust", ["Cargo.toml"]),
+        ("Go", ["go.mod"]),
+        ("Java", ["pom.xml", "build.gradle", "build.gradle.kts"]),
+        ("Ruby", ["Gemfile"]),
+        ("PHP", ["composer.json"]),
+        ("Swift", ["Package.swift"]),
+    ]
+
+    for name, files in markers:
+        if any((root / file).exists() for file in files):
+            found.append(name)
+
+    if (root / "src-tauri" / "Cargo.toml").exists() and "Rust" not in found:
+        found.append("Rust")
+
+    return found or ["unknown"]
+
+
+def package_scripts(root: Path) -> list[str]:
+    package_json = root / "package.json"
+    if not package_json.exists():
+        return []
+    try:
+        data = json.loads(package_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ["package.json scripts: unreadable"]
+
+    scripts = data.get("scripts")
+    if not isinstance(scripts, dict) or not scripts:
+        return []
+    runner = package_runner(root)
+    return [f"{script_command(runner, name)}: {command}" for name, command in sorted(scripts.items())]
+
+
+def package_runner(root: Path) -> str:
+    if (root / "pnpm-lock.yaml").exists():
+        return "pnpm"
+    if (root / "yarn.lock").exists():
+        return "yarn"
+    if (root / "bun.lockb").exists() or (root / "bun.lock").exists():
+        return "bun"
+    return "npm"
+
+
+def script_command(runner: str, name: str) -> str:
+    if runner == "npm":
+        return f"npm run {name}"
+    return f"{runner} {name}"
+
+
+def make_targets(root: Path) -> list[str]:
+    makefile = root / "Makefile"
+    if not makefile.exists():
+        return []
+
+    targets: list[str] = []
+    try:
+        lines = makefile.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ["Makefile targets: unreadable"]
+
+    for line in lines:
+        if not line or line.startswith(("\t", "#", ".")) or ":" not in line:
+            continue
+        target = line.split(":", 1)[0].strip()
+        if target and " " not in target and "=" not in target:
+            targets.append(f"make {target}")
+    return targets[:12]
+
+
+def just_targets(root: Path) -> list[str]:
+    if not (root / "justfile").exists() and not (root / "Justfile").exists():
+        return []
+    output = run(["just", "--summary"], root)
+    if not output:
+        return ["just targets: run `just --summary`"]
+    return [f"just {target}" for target in output.split()[:12]]
+
+
+def command_summary(root: Path) -> list[str]:
+    commands = package_scripts(root) + make_targets(root) + just_targets(root)
+    return commands or ["No common project commands found"]
+
+
+def interesting_docs(root: Path) -> list[str]:
+    docs: list[Path] = []
+    for child in sorted(root.iterdir(), key=lambda path: path.name.lower()):
+        if child.name in DOC_NAMES or child.name.lower().startswith("readme"):
+            docs.append(child)
+    docs_dir = root / "docs"
+    if docs_dir.is_dir():
+        docs.append(docs_dir)
+    return [relative(path, root) for path in docs] or ["No common docs found"]
+
+
+def relative(path: Path, root: Path) -> str:
+    return str(path.relative_to(root))
+
+
+def sorted_children(path: Path) -> Iterable[Path]:
+    try:
+        children = list(path.iterdir())
+    except OSError:
+        return []
+    return sorted(children, key=lambda child: (not child.is_dir(), child.name.lower()))
+
+
+def tree(root: Path, max_depth: int, max_entries: int) -> list[str]:
+    lines = ["."]
+    count = 0
+
+    def walk(directory: Path, prefix: str, depth: int) -> None:
+        nonlocal count
+        if depth > max_depth or count >= max_entries:
+            return
+
+        visible = [child for child in sorted_children(directory) if child.name not in IGNORE_DIRS]
+        for index, child in enumerate(visible):
+            if count >= max_entries:
+                return
+            connector = "└── " if index == len(visible) - 1 else "├── "
+            suffix = "/" if child.is_dir() else ""
+            lines.append(f"{prefix}{connector}{child.name}{suffix}")
+            count += 1
+            if child.is_dir():
+                extension = "    " if index == len(visible) - 1 else "│   "
+                walk(child, prefix + extension, depth + 1)
+
+    walk(root, "", 1)
+    if count >= max_entries:
+        lines.append(f"... limited to {max_entries} entries")
+    return lines
+
+
+def recent_files(root: Path) -> list[str]:
+    files: list[Path] = []
+    for directory, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name not in IGNORE_DIRS]
+        for filename in filenames:
+            path = Path(directory) / filename
+            try:
+                path.stat()
+            except OSError:
+                continue
+            files.append(path)
+
+    files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return [relative(path, root) for path in files[:20]] or ["No files found"]
+
+
+def print_section(title: str, lines: list[str]) -> None:
+    print(f"\n## {title}")
+    for line in lines:
+        print(line)
+
+
+def main() -> None:
+    args = parse_args()
+    root = Path(args.path).expanduser().resolve()
+    if not root.exists():
+        fail(f"path does not exist: {root}")
+    if not root.is_dir():
+        fail(f"path is not a directory: {root}")
+    if args.depth < 0:
+        fail("--depth must be zero or greater")
+    if args.files < 1:
+        fail("--files must be greater than zero")
+
+    print(f"# Project Brief: {root.name}")
+    print(f"Path: {root}")
+    print_section("Git", git_summary(root))
+    print_section("Changed Files", changed_files(root))
+    print_section("Changed Directories", changed_directories(root))
+    print_section("Project Type", [", ".join(detect_project_types(root))])
+    print_section("Commands", command_summary(root))
+    print_section("Docs", interesting_docs(root))
+    print_section("Tree", tree(root, args.depth, args.files))
+    print_section("Recent Files", recent_files(root))
+
+
+if __name__ == "__main__":
+    main()
